@@ -5,8 +5,21 @@
 Params are validated by the same marshmallow schemas the hosted API uses
 (tiktok/schemas.py): `user`, `video`, `hashtag`, `music`, `playlist`,
 `collection`, `place` and `effect` each accept a bare value or a pasted
-tiktok.com link."""
+tiktok.com link.
+
+[추가] 앱 전용 키 검사와 응답 캐시
+  * API_KEY 환경 변수가 있으면 X-Api-Key 헤더가 같아야 응답한다 (없으면 검사하지 않는다).
+    /, /health 는 Render 상태 확인용이라 키 없이 열어 둔다.
+  * CACHE_TTL 의 경로는 같은 요청(경로 + 쿼리)이면 정해진 시간 동안 저장해 둔 응답을 준다.
+    사용자가 늘어도 TikTok 으로 가는 요청은 경로·쿼리마다 그 시간에 한 번이다.
+    같은 요청이 동시에 여러 개 와도 TikTok 에는 한 번만 묻는다.
+    성공(200) 응답만 저장한다. 메모리에 두므로 서버가 잠들었다 깨면 비워진다.
+"""
+import hmac
 import json
+import os
+import threading
+import time
 
 from bottle import request, response, route
 
@@ -14,6 +27,84 @@ from schema_fields import load_query
 from scraper_errors import BadRequest, Blocked, NotFound, UpstreamError
 from tiktok import ads, discovery, live, schemas, search, users, videos
 
+# ---- [추가] 앱 전용 키 ------------------------------------------------------------------
+
+API_KEY = os.environ.get("API_KEY") or None
+
+
+def authorized():
+    if not API_KEY:
+        return True
+    given = request.get_header("X-Api-Key") or ""
+    return hmac.compare_digest(given.encode(), API_KEY.encode())
+
+
+# ---- [추가] 응답 캐시 -------------------------------------------------------------------
+
+# 경로 -> 저장 시간(초). 영상 주소가 몇 시간 뒤 만료되므로 길게 두지 않는다.
+CACHE_TTL = {
+    "/feed/trending": 5 * 60,       # 부를 때마다 새 묶음이 오는 피드라, 그동안은 모두 같은 묶음을 받는다
+    "/hashtags/videos": 10 * 60,
+    "/users/resolve": 24 * 60 * 60,
+}
+CACHE_MAX_ENTRIES = 300
+
+_cache = {}          # 키 -> (만료 시각, 응답 본문)
+_cache_lock = threading.Lock()
+_key_locks = {}      # 키 -> Lock (같은 요청이 동시에 와도 TikTok 에는 한 번만)
+
+
+def cache_key(path):
+    query = query_dict()
+    return path + "?" + "&".join(f"{k}={query[k]}" for k in sorted(query))
+
+
+def cache_get(key):
+    with _cache_lock:
+        entry = _cache.get(key)
+        if entry and entry[0] > time.time():
+            return entry[1]
+        return None
+
+
+def cache_put(key, ttl, body):
+    now = time.time()
+    with _cache_lock:
+        for k in [k for k, (expires, _) in _cache.items() if expires <= now]:
+            del _cache[k]
+        while len(_cache) >= CACHE_MAX_ENTRIES:
+            del _cache[min(_cache, key=lambda k: _cache[k][0])]
+        _cache[key] = (now + ttl, body)
+
+
+def lock_for(key):
+    with _cache_lock:
+        return _key_locks.setdefault(key, threading.Lock())
+
+
+def cached_call(path, label, schema, fn):
+    ttl = CACHE_TTL.get(path)
+    if not ttl:
+        return call(label, schema, fn)
+    key = cache_key(path)
+    body = cache_get(key)
+    if body is None:
+        with lock_for(key):
+            body = cache_get(key)       # 기다리는 동안 다른 요청이 받아 두었을 수 있다
+            if body is None:
+                body = call(label, schema, fn)
+                if response.status_code != 200:
+                    return body         # 실패는 저장하지 않는다
+                cache_put(key, ttl, body)
+                response.set_header("X-Cache", "MISS")
+                return body
+    response.status = 200
+    response.content_type = "application/json"
+    response.set_header("X-Cache", "HIT")
+    return body
+
+
+# ---- 원래 코드 -------------------------------------------------------------------------
 
 def json_response(data, status=200):
     response.status = status
@@ -54,7 +145,10 @@ def mount(path, schema, fn):
     label = path.strip("/")
 
     def handler():
-        return call(label, schema, fn)
+        # [추가] 키 검사 → 캐시
+        if not authorized():
+            return json_response({"error": "unauthorized"}, 401)
+        return cached_call(path, label, schema, fn)
 
     handler.__name__ = "tiktok_" + label.replace("/", "_").replace("-", "_")
     route(path, method="GET")(handler)
