@@ -56,7 +56,50 @@ _key_locks = {}      # 키 -> Lock (같은 요청이 동시에 와도 TikTok 에
 
 def cache_key(path):
     query = query_dict()
-    return path + "?" + "&".join(f"{k}={query[k]}" for k in sorted(query))
+    key = path + "?" + "&".join(f"{k}={query[k]}" for k in sorted(query))
+    return key + "|app" if app_fields() else key
+
+
+# ---- [추가] 앱용 작은 응답 -------------------------------------------------------------
+# X-Fields: app 헤더가 오면 영상 목록에서 앱(MusicTown 인기영상)이 쓰는 항목만 보낸다.
+# 화질별 영상 주소·자막·음악 정보 등을 빼면 응답이 약 350KB → 27KB (gzip 55KB → 6KB) 로 준다.
+# 쿼리 파라미터가 아니라 헤더인 이유: 모르는 쿼리 파라미터는 스키마 검사에서 400 이 되지만
+# 헤더는 무시되므로, 서버와 앱 중 어느 쪽을 먼저 배포해도 동작한다.
+
+def app_fields():
+    return (request.get_header("X-Fields") or "").lower() == "app"
+
+
+def slim_video(v):
+    video = v.get("video") or None
+    return {
+        "id": v.get("id"),
+        "link": v.get("link"),
+        "type": v.get("type"),
+        "description": v.get("description"),
+        "language": v.get("language"),
+        "created_at": v.get("created_at"),
+        "is_ad": v.get("is_ad"),
+        "is_private": v.get("is_private"),
+        "stats": {
+            "play_count": (v.get("stats") or {}).get("play_count"),
+            "like_count": (v.get("stats") or {}).get("like_count"),
+        },
+        "author": {"username": (v.get("author") or {}).get("username")},
+        "cover": v.get("cover"),
+        "video": {
+            "duration_seconds": video.get("duration_seconds"),
+            "cover": video.get("cover"),
+        } if video else None,
+    }
+
+
+def slim(data):
+    if not isinstance(data, dict) or not isinstance(data.get("videos"), list):
+        return data
+    out = {k: v for k, v in data.items() if k != "videos"}
+    out["videos"] = [slim_video(v) for v in data["videos"] if isinstance(v, dict)]
+    return out
 
 
 def cache_get(key):
@@ -125,7 +168,9 @@ def call(label, schema, fn):
     if error:
         return json_response(error, 400)
     try:
-        return json_response(fn(**data))
+        result = fn(**data)
+        # [추가] 앱이 X-Fields: app 을 보내면 필요한 항목만
+        return json_response(slim(result) if app_fields() else result)
     except ValueError as e:                # bad value
         return json_response({"error": str(e)}, 400)
     except BadRequest as e:                # upstream rejected the request (e.g. a bad cursor)
